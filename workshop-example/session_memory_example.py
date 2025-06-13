@@ -9,11 +9,26 @@ Features:
 - Long-term conversation history
 - User session preferences
 - UUID-based user identification
+- Automatic connection retry with exponential backoff
+
+Connection Retry Logic:
+- Automatically retries failed PostgreSQL connections up to 3 times
+- Uses exponential backoff: delays of 2, 4, and 8 seconds
+- Shows progress indicators during retry attempts
+- Provides clear error messages and troubleshooting tips
 
 Prerequisites:
 - PostgreSQL database running
 - Database created (e.g., CREATE DATABASE agno_memory;)
 - Connection string in POSTGRES_URL environment variable
+
+Environment Variables:
+- POSTGRES_URL: Full connection URL (overrides all other settings)
+- POSTGRES_HOST: Database host (default: localhost)
+- POSTGRES_PORT: Database port (default: 5432)
+- POSTGRES_USER: Database username (default: postgres)
+- POSTGRES_PASSWORD: Database password
+- POSTGRES_DB: Database name (default: agno_memory)
 
 Usage:
 - python persistent_session_example.py <username>
@@ -23,7 +38,8 @@ Usage:
 import os
 import sys
 import uuid
-from typing import Optional, List
+import time
+from typing import Optional, List, TypeVar, Callable
 from datetime import datetime, timedelta
 
 # Core Agno imports
@@ -48,6 +64,80 @@ from rich.table import Table
 console = Console()
 
 load_dotenv("../.env")
+
+# Retry configuration constants
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_BASE_DELAY = 2  # Base delay in seconds for exponential backoff
+CONNECTION_TIMEOUT = 10  # Connection timeout in seconds
+
+# Type variable for generic connection return type
+T = TypeVar('T')
+
+
+def connect_with_retry(
+    connection_func: Callable[[], T],
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    base_delay: int = DEFAULT_BASE_DELAY,
+    connection_name: str = "database"
+) -> T:
+    """
+    Attempt to establish a connection with exponential backoff retry logic.
+    
+    Args:
+        connection_func: A callable that attempts to establish a connection
+        max_retries: Maximum number of retry attempts (default: 3)
+        base_delay: Base delay in seconds for exponential backoff (default: 2)
+        connection_name: Name of the connection for logging purposes
+        
+    Returns:
+        The connection object returned by connection_func
+        
+    Raises:
+        Exception: If all retry attempts fail
+    """
+    last_exception = None
+    
+    for attempt in range(max_retries):
+        try:
+            # Attempt to establish connection
+            console.print(f"[cyan]Attempting to connect to {connection_name}...[/cyan]")
+            connection = connection_func()
+            console.print(f"[green]✓ Successfully connected to {connection_name}[/green]")
+            return connection
+            
+        except Exception as e:
+            last_exception = e
+            
+            if attempt < max_retries - 1:
+                # Calculate delay with exponential backoff
+                delay = base_delay ** (attempt + 1)
+                
+                console.print(
+                    f"[yellow]Connection attempt {attempt + 1} failed: {str(e)}[/yellow]"
+                )
+                console.print(
+                    f"[yellow]Retrying in {delay} seconds... (attempt {attempt + 2}/{max_retries})[/yellow]"
+                )
+                
+                # Show progress dots during wait
+                for i in range(delay):
+                    print(".", end="", flush=True)
+                    time.sleep(1)
+                print()  # New line after dots
+                
+            else:
+                # Final attempt failed
+                console.print(
+                    f"[red]✗ All {max_retries} connection attempts failed[/red]"
+                )
+                console.print(
+                    f"[red]Last error: {str(e)}[/red]"
+                )
+    
+    # If we get here, all attempts failed
+    raise last_exception if last_exception else Exception(
+        f"Failed to connect to {connection_name} after {max_retries} attempts"
+    )
 
 
 def get_user_id_from_argument():
@@ -163,18 +253,24 @@ class PersistentSessionAgent:
         db_url = PostgresConfig.get_db_url()
 
         console.print(
-            "[cyan]Connecting to PostgreSQL for persistent sessions...[/cyan]"
+            "[cyan]Initializing PostgreSQL connections for persistent sessions...[/cyan]"
         )
 
         try:
-            # Initialize memory database with PostgreSQL
-            self.memory_db = PostgresMemoryDb(
-                table_name="persistent_user_memories", db_url=db_url
+            # Initialize memory database with PostgreSQL using retry logic
+            self.memory_db = connect_with_retry(
+                lambda: PostgresMemoryDb(
+                    table_name="persistent_user_memories", db_url=db_url
+                ),
+                connection_name="PostgreSQL Memory Database"
             )
 
-            # Initialize session storage with PostgreSQL
-            self.storage = PostgresStorage(
-                table_name="persistent_agent_sessions", db_url=db_url
+            # Initialize session storage with PostgreSQL using retry logic
+            self.storage = connect_with_retry(
+                lambda: PostgresStorage(
+                    table_name="persistent_agent_sessions", db_url=db_url
+                ),
+                connection_name="PostgreSQL Session Storage"
             )
 
             # Create memory object
@@ -183,12 +279,24 @@ class PersistentSessionAgent:
             # Initialize the agent
             self.agent = self._create_agent()
 
-            console.print("[green]✓ Successfully connected to PostgreSQL[/green]")
+            console.print("[green]✓ All PostgreSQL connections established successfully[/green]")
 
         except Exception as e:
-            console.print(f"[red]✗ Failed to connect to PostgreSQL: {str(e)}[/red]")
+            console.print(f"[red]✗ Failed to establish PostgreSQL connections: {str(e)}[/red]")
             console.print(
-                "[yellow]Make sure PostgreSQL is running and the database exists.[/yellow]"
+                "[yellow]Troubleshooting tips:[/yellow]"
+            )
+            console.print(
+                "[yellow]1. Ensure PostgreSQL is running[/yellow]"
+            )
+            console.print(
+                "[yellow]2. Verify the database exists (CREATE DATABASE agno_memory;)[/yellow]"
+            )
+            console.print(
+                "[yellow]3. Check your POSTGRES_URL environment variable[/yellow]"
+            )
+            console.print(
+                f"[yellow]4. Current connection URL: {db_url}[/yellow]"
             )
             raise
 
@@ -333,9 +441,12 @@ class SessionManager:
         self.user_id = user_id
         self.db_url = PostgresConfig.get_db_url()
 
-        # Initialize storage for session management
-        self.storage = PostgresStorage(
-            table_name="persistent_agent_sessions", db_url=self.db_url
+        # Initialize storage for session management with retry logic
+        self.storage = connect_with_retry(
+            lambda: PostgresStorage(
+                table_name="persistent_agent_sessions", db_url=self.db_url
+            ),
+            connection_name="PostgreSQL Session Storage (SessionManager)"
         )
 
     def create_new_session(self) -> str:
