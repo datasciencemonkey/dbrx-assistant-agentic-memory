@@ -12,6 +12,7 @@ This repository contains examples of implementing memory systems for AI agents, 
 - **User-Specific Sessions**: Each user gets their own memory space with UUID-based identification
 - **Session Management**: Automatic session continuation or creation based on time intervals
 - **PostgreSQL Backend**: Reliable, scalable storage for long-term memory persistence
+- **Connection Resilience**: Automatic retry logic with exponential backoff for database connections
 - **Multi-Agent Support**: Examples showing memory sharing between multiple agents
 - **Interactive CLI**: User-friendly command-line interface with rich formatting
 
@@ -20,7 +21,8 @@ This repository contains examples of implementing memory systems for AI agents, 
 ```
 .
 ├── workshop-example/                 # ⭐ MAIN DEMO - Start here!
-│   └── session_memory_example.py    # Persistent session memory with PostgreSQL
+│   ├── session_memory_example.py    # Persistent session memory with PostgreSQL
+│   └── test_retry_connection.py     # Test suite for connection retry logic
 ├── other-examples/                  # Additional examples
 │   ├── basic_memory_example.py      # Simple memory usage
 │   ├── advanced_memory_example.py   # Advanced memory features
@@ -95,6 +97,14 @@ During a chat session, you can use these commands:
 - `help` - Show available commands
 - `quit` or `exit` - End the conversation
 
+### Connection Resilience
+
+The system includes automatic connection retry logic with exponential backoff:
+- **Automatic Retries**: Up to 3 connection attempts with 2, 4, and 8 second delays
+- **Progress Indicators**: Visual feedback during retry attempts  
+- **Clear Error Messages**: Helpful troubleshooting tips when connections fail
+- **Graceful Degradation**: Proper error handling for persistent connection issues
+
 ### Example Usage
 
 ```bash
@@ -104,6 +114,12 @@ Persistent Session Example (PostgreSQL)
 
 Username: alice
 User UUID: 5b1e3542-8d6f-5c9e-b7f2-123456789abc
+Initializing PostgreSQL connections for persistent sessions...
+Attempting to connect to PostgreSQL Memory Database...
+✓ Successfully connected to PostgreSQL Memory Database
+Attempting to connect to PostgreSQL Session Storage...
+✓ Successfully connected to PostgreSQL Session Storage
+✓ All PostgreSQL connections established successfully
 Starting new session for user 'alice': alice_20250113_143022_a1b2c3d4
 
 Welcome, alice! Starting a new conversation...
