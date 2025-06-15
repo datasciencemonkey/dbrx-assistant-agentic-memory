@@ -10,12 +10,22 @@ Features:
 - User session preferences
 - UUID-based user identification
 - Automatic connection retry with exponential backoff
+- Advanced session search and filtering capabilities
 
 Connection Retry Logic:
 - Automatically retries failed PostgreSQL connections up to 3 times
 - Uses exponential backoff: delays of 2, 4, and 8 seconds
 - Shows progress indicators during retry attempts
 - Provides clear error messages and troubleshooting tips
+
+Session Search & Filtering:
+- Search conversations by keywords or content
+- Filter sessions by date ranges (--from, --to)
+- Advanced regex pattern matching support
+- Search stored memories separately
+- Interactive navigation between search results
+- Highlighted search terms in results
+- Paginated results display
 
 Prerequisites:
 - PostgreSQL database running
@@ -33,13 +43,23 @@ Environment Variables:
 Usage:
 - python persistent_session_example.py <username>
 - Example: python persistent_session_example.py john_doe
+
+Search Commands:
+- search <keywords> - Find conversations containing keywords
+- search --from 2024-01-01 --to 2024-12-31 - Date range search
+- search --regex 'pattern' - Use regex pattern matching
+- search --memories <keywords> - Search stored memories
+- view <index> - View detailed session from search results
+- continue <index> - Switch to a session from search results
 """
 
 import os
 import sys
 import uuid
 import time
-from typing import Optional, List, TypeVar, Callable
+import re
+import psycopg2
+from typing import Optional, List, TypeVar, Callable, Dict, Any
 from datetime import datetime, timedelta
 
 # Core Agno imports
@@ -138,6 +158,230 @@ def connect_with_retry(
     raise last_exception if last_exception else Exception(
         f"Failed to connect to {connection_name} after {max_retries} attempts"
     )
+
+
+class SessionSearcher:
+    """
+    Advanced session search functionality with full-text search, date filtering,
+    and regex support for searching through conversation history.
+    """
+    
+    def __init__(self, db_url: str, table_name: str = "persistent_agent_sessions"):
+        self.db_url = db_url
+        self.table_name = table_name
+    
+    def search_sessions(
+        self,
+        user_id: str,
+        query: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        use_regex: bool = False,
+        limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """
+        Search sessions by content, date range, or regex patterns.
+        
+        Args:
+            user_id: User ID to search sessions for
+            query: Search query string (keywords or regex pattern)
+            start_date: Start date for date range filtering
+            end_date: End date for date range filtering
+            use_regex: Whether to use regex pattern matching
+            limit: Maximum number of results to return
+            
+        Returns:
+            List of session dictionaries with metadata and snippets
+        """
+        try:
+            with psycopg2.connect(self.db_url) as conn:
+                with conn.cursor() as cursor:
+                    # Base query to get session data
+                    base_query = f"""
+                    SELECT session_id, user_id, runs, created_at, updated_at
+                    FROM {self.table_name}
+                    WHERE user_id = %s
+                    """
+                    params = [user_id]
+                    
+                    # Add date filtering
+                    if start_date:
+                        base_query += " AND created_at >= %s"
+                        params.append(start_date)
+                    
+                    if end_date:
+                        base_query += " AND created_at <= %s"
+                        params.append(end_date)
+                    
+                    # Add content search
+                    if query:
+                        if use_regex:
+                            # Use PostgreSQL regex matching
+                            base_query += " AND runs::text ~* %s"
+                            params.append(query)
+                        else:
+                            # Use full-text search with PostgreSQL's built-in capabilities
+                            base_query += " AND runs::text ILIKE %s"
+                            params.append(f"%{query}%")
+                    
+                    base_query += " ORDER BY created_at DESC LIMIT %s"
+                    params.append(limit)
+                    
+                    cursor.execute(base_query, params)
+                    results = cursor.fetchall()
+                    
+                    # Process results and extract snippets
+                    processed_results = []
+                    for row in results:
+                        session_data = {
+                            'session_id': row[0],
+                            'user_id': row[1],
+                            'runs_data': row[2],
+                            'created_at': row[3],
+                            'updated_at': row[4],
+                            'snippet': self._extract_snippet(row[2], query, use_regex),
+                            'match_count': self._count_matches(row[2], query, use_regex) if query else 0
+                        }
+                        processed_results.append(session_data)
+                    
+                    return processed_results
+                    
+        except Exception as e:
+            console.print(f"[red]Error searching sessions: {str(e)}[/red]")
+            return []
+    
+    def _extract_snippet(self, runs_data: Any, query: Optional[str], use_regex: bool = False) -> str:
+        """
+        Extract a relevant snippet from the conversation data.
+        
+        Args:
+            runs_data: The conversation/runs data from the database
+            query: Search query to highlight
+            use_regex: Whether query is a regex pattern
+            
+        Returns:
+            A snippet of the conversation with highlighted matches
+        """
+        try:
+            # Convert runs data to string for searching
+            content = str(runs_data) if runs_data else ""
+            
+            if not query or not content:
+                # Return first 200 characters if no query
+                return content[:200] + "..." if len(content) > 200 else content
+            
+            if use_regex:
+                # Find regex matches
+                matches = list(re.finditer(query, content, re.IGNORECASE))
+                if matches:
+                    match = matches[0]
+                    start = max(0, match.start() - 100)
+                    end = min(len(content), match.end() + 100)
+                    snippet = content[start:end]
+                    return f"...{snippet}..." if start > 0 or end < len(content) else snippet
+            else:
+                # Find keyword matches (case-insensitive)
+                query_lower = query.lower()
+                content_lower = content.lower()
+                
+                pos = content_lower.find(query_lower)
+                if pos != -1:
+                    start = max(0, pos - 100)
+                    end = min(len(content), pos + len(query) + 100)
+                    snippet = content[start:end]
+                    return f"...{snippet}..." if start > 0 or end < len(content) else snippet
+            
+            # Fallback to beginning of content
+            return content[:200] + "..." if len(content) > 200 else content
+            
+        except Exception:
+            return "Error extracting snippet"
+    
+    def _count_matches(self, runs_data: Any, query: Optional[str], use_regex: bool = False) -> int:
+        """
+        Count the number of matches for the query in the conversation data.
+        
+        Args:
+            runs_data: The conversation/runs data from the database
+            query: Search query
+            use_regex: Whether query is a regex pattern
+            
+        Returns:
+            Number of matches found
+        """
+        try:
+            content = str(runs_data) if runs_data else ""
+            
+            if not query or not content:
+                return 0
+            
+            if use_regex:
+                matches = re.findall(query, content, re.IGNORECASE)
+                return len(matches)
+            else:
+                # Count case-insensitive keyword matches
+                return content.lower().count(query.lower())
+                
+        except Exception:
+            return 0
+    
+    def search_memories(
+        self,
+        user_id: str,
+        query: str,
+        use_regex: bool = False,
+        limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """
+        Search through stored memories for the user.
+        
+        Args:
+            user_id: User ID to search memories for
+            query: Search query string
+            use_regex: Whether to use regex pattern matching
+            limit: Maximum number of results to return
+            
+        Returns:
+            List of matching memories with metadata
+        """
+        try:
+            with psycopg2.connect(self.db_url) as conn:
+                with conn.cursor() as cursor:
+                    memory_table = "persistent_user_memories"
+                    
+                    if use_regex:
+                        search_query = f"""
+                        SELECT memory, created_at, updated_at
+                        FROM {memory_table}
+                        WHERE user_id = %s AND memory ~* %s
+                        ORDER BY created_at DESC LIMIT %s
+                        """
+                        params = [user_id, query, limit]
+                    else:
+                        search_query = f"""
+                        SELECT memory, created_at, updated_at
+                        FROM {memory_table}
+                        WHERE user_id = %s AND memory ILIKE %s
+                        ORDER BY created_at DESC LIMIT %s
+                        """
+                        params = [user_id, f"%{query}%", limit]
+                    
+                    cursor.execute(search_query, params)
+                    results = cursor.fetchall()
+                    
+                    return [
+                        {
+                            'memory': row[0],
+                            'created_at': row[1],
+                            'updated_at': row[2],
+                            'match_count': self._count_matches(row[0], query, use_regex)
+                        }
+                        for row in results
+                    ]
+                    
+        except Exception as e:
+            console.print(f"[red]Error searching memories: {str(e)}[/red]")
+            return []
 
 
 def get_user_id_from_argument():
@@ -251,6 +495,9 @@ class PersistentSessionAgent:
 
         # Get PostgreSQL connection parameters
         db_url = PostgresConfig.get_db_url()
+        
+        # Initialize search functionality
+        self.searcher = SessionSearcher(db_url)
 
         console.print(
             "[cyan]Initializing PostgreSQL connections for persistent sessions...[/cyan]"
@@ -432,6 +679,282 @@ class PersistentSessionAgent:
 
         except Exception as e:
             console.print(f"[red]Error accessing memories: {str(e)}[/red]")
+    
+    def search_conversations(self, search_input: str):
+        """
+        Parse search command and execute search with various options.
+        
+        Supports:
+        - search <query> - Basic keyword search
+        - search --regex <pattern> - Regex pattern search
+        - search --from YYYY-MM-DD --to YYYY-MM-DD - Date range search
+        - search <query> --from YYYY-MM-DD - Combined search
+        - search --memories <query> - Search memories instead of sessions
+        """
+        try:
+            # Parse search command
+            parts = search_input.strip().split()
+            
+            if len(parts) < 2:
+                console.print("[yellow]Search usage examples:[/yellow]")
+                console.print("• search <keywords> - Search for keywords in conversations")
+                console.print("• search --regex <pattern> - Use regex pattern matching")
+                console.print("• search --from 2024-01-01 --to 2024-12-31 - Date range search")
+                console.print("• search <keywords> --from 2024-01-01 - Search with date filter")
+                console.print("• search --memories <keywords> - Search stored memories")
+                return
+            
+            # Initialize search parameters
+            query = None
+            start_date = None
+            end_date = None
+            use_regex = False
+            search_memories = False
+            
+            i = 1  # Skip 'search' command
+            while i < len(parts):
+                arg = parts[i]
+                
+                if arg == "--regex":
+                    use_regex = True
+                    if i + 1 < len(parts) and not parts[i + 1].startswith("--"):
+                        query = parts[i + 1]
+                        i += 2
+                    else:
+                        i += 1
+                elif arg == "--from":
+                    if i + 1 < len(parts):
+                        try:
+                            start_date = datetime.strptime(parts[i + 1], "%Y-%m-%d")
+                            i += 2
+                        except ValueError:
+                            console.print(f"[red]Invalid date format: {parts[i + 1]}. Use YYYY-MM-DD[/red]")
+                            return
+                    else:
+                        console.print("[red]--from requires a date argument[/red]")
+                        return
+                elif arg == "--to":
+                    if i + 1 < len(parts):
+                        try:
+                            end_date = datetime.strptime(parts[i + 1], "%Y-%m-%d")
+                            i += 2
+                        except ValueError:
+                            console.print(f"[red]Invalid date format: {parts[i + 1]}. Use YYYY-MM-DD[/red]")
+                            return
+                    else:
+                        console.print("[red]--to requires a date argument[/red]")
+                        return
+                elif arg == "--memories":
+                    search_memories = True
+                    if i + 1 < len(parts) and not parts[i + 1].startswith("--"):
+                        query = parts[i + 1]
+                        i += 2
+                    else:
+                        i += 1
+                elif not arg.startswith("--"):
+                    # Regular search query
+                    if query is None:
+                        query = arg
+                    else:
+                        query += " " + arg
+                    i += 1
+                else:
+                    console.print(f"[red]Unknown option: {arg}[/red]")
+                    return
+            
+            # Execute search
+            if search_memories:
+                if not query:
+                    console.print("[red]Memory search requires a query[/red]")
+                    return
+                self._display_memory_search_results(query, use_regex)
+            else:
+                self._display_session_search_results(query, start_date, end_date, use_regex)
+                
+        except Exception as e:
+            console.print(f"[red]Error processing search: {str(e)}[/red]")
+    
+    def _display_session_search_results(
+        self,
+        query: Optional[str],
+        start_date: Optional[datetime],
+        end_date: Optional[datetime],
+        use_regex: bool = False
+    ):
+        """Display session search results in a formatted table."""
+        
+        console.print(f"\n[bold cyan]Searching Sessions for User: {self.user_id}[/bold cyan]")
+        
+        # Build search description
+        search_desc = []
+        if query:
+            search_desc.append(f"Query: '{query}'" + (" (regex)" if use_regex else ""))
+        if start_date:
+            search_desc.append(f"From: {start_date.strftime('%Y-%m-%d')}")
+        if end_date:
+            search_desc.append(f"To: {end_date.strftime('%Y-%m-%d')}")
+        
+        if search_desc:
+            console.print(f"[yellow]Search criteria: {' | '.join(search_desc)}[/yellow]")
+        else:
+            console.print("[yellow]Showing all sessions[/yellow]")
+        
+        # Perform search
+        results = self.searcher.search_sessions(
+            user_id=self.user_id,
+            query=query,
+            start_date=start_date,
+            end_date=end_date,
+            use_regex=use_regex,
+            limit=20
+        )
+        
+        if not results:
+            console.print("[yellow]No sessions found matching your criteria.[/yellow]")
+            return
+        
+        # Create results table
+        table = Table(title=f"Search Results ({len(results)} sessions)")
+        table.add_column("Index", style="cyan", no_wrap=True, width=5)
+        table.add_column("Session ID", style="green", width=20)
+        table.add_column("Date", style="yellow", width=12)
+        table.add_column("Matches", style="red", no_wrap=True, width=7)
+        table.add_column("Snippet", style="white", width=60)
+        
+        for idx, result in enumerate(results, 1):
+            # Format date
+            created_date = result['created_at']
+            if isinstance(created_date, datetime):
+                date_str = created_date.strftime('%Y-%m-%d')
+            else:
+                date_str = str(created_date)[:10] if created_date else "Unknown"
+            
+            # Truncate session ID for display
+            session_display = result['session_id'][-20:] if len(result['session_id']) > 20 else result['session_id']
+            
+            # Truncate snippet and highlight query terms
+            snippet = result['snippet']
+            if len(snippet) > 60:
+                snippet = snippet[:57] + "..."
+            
+            # Highlight query terms in snippet (simple highlighting)
+            if query and not use_regex:
+                snippet = snippet.replace(
+                    query, f"[bold red]{query}[/bold red]"
+                ) if query.lower() in snippet.lower() else snippet
+            
+            table.add_row(
+                str(idx),
+                session_display,
+                date_str,
+                str(result['match_count']),
+                snippet
+            )
+        
+        console.print(table)
+        
+        # Store results for navigation
+        self.set_search_results(results)
+        
+        # Show navigation options
+        console.print(f"\n[bold cyan]Navigation Options:[/bold cyan]")
+        console.print("• Type 'view <index>' to view full session details")
+        console.print("• Type 'continue <index>' to switch to that session")
+    
+    def _display_memory_search_results(self, query: str, use_regex: bool = False):
+        """Display memory search results."""
+        
+        console.print(f"\n[bold cyan]Searching Memories for: '{query}'[/bold cyan]")
+        if use_regex:
+            console.print("[yellow](Using regex pattern matching)[/yellow]")
+        
+        results = self.searcher.search_memories(
+            user_id=self.user_id,
+            query=query,
+            use_regex=use_regex,
+            limit=10
+        )
+        
+        if not results:
+            console.print("[yellow]No memories found matching your query.[/yellow]")
+            return
+        
+        console.print(f"\n[bold green]Found {len(results)} matching memories:[/bold green]")
+        
+        for idx, result in enumerate(results, 1):
+            memory_text = result['memory']
+            match_count = result['match_count']
+            
+            # Highlight query terms in memory (simple highlighting)
+            if not use_regex and query.lower() in memory_text.lower():
+                highlighted = memory_text.replace(
+                    query, f"[bold red]{query}[/bold red]"
+                ) if query.lower() in memory_text.lower() else memory_text
+            else:
+                highlighted = memory_text
+            
+            console.print(
+                Panel(
+                    f"[yellow]Memory {idx} ({match_count} matches):[/yellow]\n{highlighted}",
+                    expand=False,
+                )
+            )
+    
+    def set_search_results(self, results: List[Dict[str, Any]]):
+        """Store search results for navigation purposes."""
+        self.last_search_results = results
+    
+    def view_session_details(self, index: int):
+        """View detailed information about a session from search results."""
+        if not hasattr(self, 'last_search_results') or not self.last_search_results:
+            console.print("[red]No search results available. Please run a search first.[/red]")
+            return
+        
+        if index < 1 or index > len(self.last_search_results):
+            console.print(f"[red]Invalid index. Please use a number between 1 and {len(self.last_search_results)}[/red]")
+            return
+        
+        result = self.last_search_results[index - 1]
+        
+        console.print(f"\n[bold cyan]Session Details:[/bold cyan]")
+        console.print(f"[yellow]Session ID:[/yellow] {result['session_id']}")
+        console.print(f"[yellow]Created:[/yellow] {result['created_at']}")
+        console.print(f"[yellow]Updated:[/yellow] {result.get('updated_at', 'N/A')}")
+        console.print(f"[yellow]Match Count:[/yellow] {result['match_count']}")
+        
+        # Show more detailed snippet
+        full_snippet = result.get('runs_data', '')
+        if full_snippet:
+            # Try to extract meaningful conversation content
+            snippet_preview = str(full_snippet)[:1000]
+            console.print(f"\n[yellow]Session Content Preview:[/yellow]")
+            console.print(Panel(snippet_preview + ("..." if len(str(full_snippet)) > 1000 else ""), expand=False))
+        
+        console.print(f"\n[cyan]To switch to this session, type: continue {index}[/cyan]")
+    
+    def switch_to_session(self, index: int):
+        """Switch the current session to a session from search results."""
+        if not hasattr(self, 'last_search_results') or not self.last_search_results:
+            console.print("[red]No search results available. Please run a search first.[/red]")
+            return False
+        
+        if index < 1 or index > len(self.last_search_results):
+            console.print(f"[red]Invalid index. Please use a number between 1 and {len(self.last_search_results)}[/red]")
+            return False
+        
+        result = self.last_search_results[index - 1]
+        new_session_id = result['session_id']
+        
+        console.print(f"[green]Switching to session: {new_session_id}[/green]")
+        
+        # Update the agent's session ID
+        self.session_id = new_session_id
+        self.agent.session_id = new_session_id
+        
+        console.print("[green]✓ Session switched successfully![/green]")
+        console.print("[cyan]You can now continue the conversation from where it left off.[/cyan]")
+        
+        return True
 
 
 class SessionManager:
@@ -608,6 +1131,7 @@ def persistent_session_example():
         console.print("• 'memories' - Show stored memories")
         console.print("• 'sessions' - Show all available sessions")
         console.print("• 'summary' - Show current session summary")
+        console.print("• 'search <query>' - Search conversations and memories")
         console.print("• 'quit' or 'exit' - End the conversation")
         console.print("\n" + "=" * 60 + "\n")
 
@@ -647,14 +1171,41 @@ def persistent_session_example():
                     agent.show_session_summary()
                     continue
 
+                elif user_input.lower().startswith("search"):
+                    agent.search_conversations(user_input)
+                    continue
+
+                elif user_input.lower().startswith("view "):
+                    try:
+                        index = int(user_input.split()[1])
+                        agent.view_session_details(index)
+                    except (IndexError, ValueError):
+                        console.print("[red]Usage: view <index> (e.g., view 1)[/red]")
+                    continue
+
+                elif user_input.lower().startswith("continue "):
+                    try:
+                        index = int(user_input.split()[1])
+                        if agent.switch_to_session(index):
+                            console.print(f"[green]Now in session: {agent.session_id}[/green]")
+                    except (IndexError, ValueError):
+                        console.print("[red]Usage: continue <index> (e.g., continue 1)[/red]")
+                    continue
+
                 elif user_input.lower() in ["help", "commands"]:
                     console.print("\n[bold cyan]Available Commands:[/bold cyan]")
                     console.print("• Type your message to chat with the agent")
                     console.print("• 'memories' - Show stored memories")
                     console.print("• 'sessions' - Show all available sessions")
                     console.print("• 'summary' - Show current session summary")
+                    console.print("• 'search <query>' - Search conversations and memories")
                     console.print("• 'help' - Show this help message")
                     console.print("• 'quit' or 'exit' - End the conversation")
+                    console.print("\n[yellow]Search Examples:[/yellow]")
+                    console.print("• search hello - Find conversations containing 'hello'")
+                    console.print("• search --from 2024-01-01 - Sessions from a specific date")
+                    console.print("• search --regex 'user.*name' - Use regex patterns")
+                    console.print("• search --memories python - Search stored memories")
                     continue
 
                 # Send message to agent
